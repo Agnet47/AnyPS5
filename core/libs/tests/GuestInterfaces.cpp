@@ -48,6 +48,7 @@ static void Require(bool value) { if (!value) std::abort(); }
 
 constexpr std::uint32_t knownFlags = 0x1 | 0x2 | 0x8 | 0x10 | 0x40 | 0x80 | 0x100 | 0x200 | 0x8000;
 constexpr std::uint32_t loopbackFlag = 0x8;
+constexpr std::uint32_t runningFlag = 0x40;
 
 struct HostLink {
     std::string name;
@@ -74,9 +75,8 @@ struct HostSnapshot {
     std::vector<HostAddress> address;
 };
 
+#ifndef _WIN32
 static std::uint32_t FlagsFromHost(unsigned int host) {
-    // Must mirror libc/src/Interfaces.cpp InterfaceFlags exactly (same IFF_* -> guest
-    // mapping) so the snapshot's flags equal the guest's flags on every platform.
     const std::pair<unsigned int, std::uint32_t> map[] = {
         {IFF_UP, 0x1}, {IFF_BROADCAST, 0x2}, {IFF_LOOPBACK, 0x8}, {IFF_POINTOPOINT, 0x10},
         {IFF_RUNNING, 0x40}, {IFF_NOARP, 0x80}, {IFF_PROMISC, 0x100}, {IFF_ALLMULTI, 0x200},
@@ -107,6 +107,7 @@ static void AddHostAddress(HostSnapshot& snapshot, const char* name, int family,
     }
     snapshot.address.push_back(std::move(entry));
 }
+#endif
 
 static HostSnapshot TakeHostSnapshot() {
     HostSnapshot snapshot;
@@ -122,9 +123,11 @@ static HostSnapshot TakeHostSnapshot() {
     if (result == ERROR_NO_DATA) return snapshot;
     Require(result == NO_ERROR);
     for (auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(storage.data()); adapter; adapter = adapter->Next) {
-        char name[NDIS_IF_MAX_STRING_SIZE + 1] = {};
-        const auto status = ConvertInterfaceLuidToNameA(&adapter->Luid, name, sizeof(name));
+        char hostName[NDIS_IF_MAX_STRING_SIZE + 1] = {};
+        const auto status = ConvertInterfaceLuidToNameA(&adapter->Luid, hostName, sizeof(hostName));
         Require(status == NO_ERROR);
+        const std::string name = std::strlen(hostName) < 16 ? std::string(hostName)
+            : "if" + std::to_string(adapter->IfIndex ? adapter->IfIndex : adapter->Ipv6IfIndex);
         HostLink link;
         link.name = name;
         std::uint32_t flags = 0;
@@ -136,7 +139,7 @@ static HostSnapshot TakeHostSnapshot() {
         link.index = static_cast<std::uint16_t>(adapter->IfIndex ? adapter->IfIndex : adapter->Ipv6IfIndex);
         link.type = (flags & loopbackFlag) ? 24 : 6;
         link.mtu = adapter->Mtu;
-        link.addrlen = static_cast<std::uint8_t>(adapter->PhysicalAddressLength <= 8 ? adapter->PhysicalAddressLength : 0);
+        link.addrlen = static_cast<std::uint8_t>(adapter->PhysicalAddressLength <= 8 && link.type != 24 ? adapter->PhysicalAddressLength : 0);
         std::memset(link.mac, 0, sizeof(link.mac));
         if (link.addrlen != 0) std::memcpy(link.mac, adapter->PhysicalAddress, link.addrlen);
         link.consumed = false;
@@ -184,7 +187,7 @@ static HostSnapshot TakeHostSnapshot() {
                 entry.index = static_cast<std::uint16_t>(link->sll_ifindex);
                 entry.type = (entry.flags & loopbackFlag) ? 24 : 6;
                 entry.mtu = 0;
-                entry.addrlen = static_cast<std::uint8_t>(link->sll_halen <= 8 ? link->sll_halen : 0);
+                entry.addrlen = static_cast<std::uint8_t>(link->sll_halen <= 8 && entry.type != 24 ? link->sll_halen : 0);
                 std::memset(entry.mac, 0, sizeof(entry.mac));
                 if (entry.addrlen != 0) std::memcpy(entry.mac, link->sll_addr, entry.addrlen);
                 entry.consumed = false;
@@ -255,6 +258,8 @@ int main() {
                     if (std::memcmp(address + 8, expected.name.c_str(), nlen) != 0) continue;
                     if (std::memcmp(address + 8 + nlen, expected.mac, alen) != 0) continue;
                     if (data[0] != expected.type || data[2] != expected.addrlen || mtu != expected.mtu || item->flags != expected.flags) continue;
+                    if (address[0] != 54 || data[3] != (expected.type == 6 ? 14 : 0)) continue;
+                    if (data[4] != ((expected.flags & runningFlag) ? 2 : 1) || data[6] != 152 || data[7] != 0) continue;
                     expected.consumed = true;
                     found = true;
                     break;

@@ -60,9 +60,12 @@ constexpr std::size_t ifDataBytes = 152;
 constexpr std::uint8_t iftEther = 6;
 constexpr std::uint8_t iftLoopback = 24;
 constexpr std::uint8_t ethernetHeader = 14;
+constexpr std::uint8_t linkStateDown = 1;
+constexpr std::uint8_t linkStateUp = 2;
 
 struct Address {
     int family;
+    std::uint32_t flags;
     std::vector<std::uint8_t> address;
     std::vector<std::uint8_t> netmask;
     std::vector<std::uint8_t> destination;
@@ -109,6 +112,13 @@ std::vector<std::uint8_t> GuestIpv6(const std::uint8_t* bytes, std::uint32_t sco
     return guest;
 }
 
+std::vector<std::uint8_t> GuestAddress(const sockaddr* address) {
+    if (address->sa_family == AF_INET)
+        return GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(address)->sin_addr));
+    const auto* v6 = reinterpret_cast<const sockaddr_in6*>(address);
+    return GuestIpv6(reinterpret_cast<const std::uint8_t*>(&v6->sin6_addr), v6->sin6_scope_id);
+}
+
 std::vector<std::uint8_t> BroadcastAddress(const std::vector<std::uint8_t>& address, const std::vector<std::uint8_t>& netmask) {
     std::vector<std::uint8_t> broadcast = address;
     for (std::size_t index = 4; index < 8; ++index)
@@ -136,7 +146,7 @@ std::vector<std::uint8_t> GuestIfData(const Entry& entry) {
     blob[0] = entry.type;
     blob[2] = entry.addrlen;
     blob[3] = (entry.type == iftEther ? ethernetHeader : 0);
-    blob[4] = (entry.flags & guestUp) ? 1 : 0;
+    blob[4] = (entry.flags & guestRunning) ? linkStateUp : linkStateDown;
     blob[6] = static_cast<std::uint8_t>(ifDataBytes & 0xff);
     blob[7] = static_cast<std::uint8_t>((ifDataBytes >> 8) & 0xff);
     blob[8] = static_cast<std::uint8_t>(entry.mtu & 0xff);
@@ -148,6 +158,7 @@ std::vector<std::uint8_t> GuestIfData(const Entry& entry) {
 
 void SetType(Entry& entry) {
     entry.type = (entry.flags & guestLoopback) ? iftLoopback : iftEther;
+    if (entry.type == iftLoopback) entry.addrlen = 0;
 }
 
 #ifdef _WIN32
@@ -206,9 +217,8 @@ int HostEntries(std::vector<Entry>& entries) {
             if (!address || (address->sa_family != AF_INET && address->sa_family != AF_INET6)) continue;
             Address addr;
             addr.family = address->sa_family == AF_INET ? guestAfInet : guestAfInet6;
-            addr.address = address->sa_family == AF_INET
-                ? GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(address)->sin_addr))
-                : GuestIpv6(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr), reinterpret_cast<const sockaddr_in6*>(address)->sin6_scope_id);
+            addr.flags = entry.flags;
+            addr.address = GuestAddress(address);
             addr.netmask = PrefixMask(address->sa_family, unicast->OnLinkPrefixLength);
             if (address->sa_family == AF_INET && (entry.flags & guestBroadcast))
                 addr.destination = BroadcastAddress(addr.address, addr.netmask);
@@ -219,6 +229,16 @@ int HostEntries(std::vector<Entry>& entries) {
     return 0;
 }
 #else
+int GuestHostError(int hostError, const char* operation) {
+    switch (hostError) {
+    case ENOMEM: *__error_nid_postfix() = 12; return -1;
+    case ENOBUFS: *__error_nid_postfix() = 55; return -1;
+    case EMFILE: *__error_nid_postfix() = 24; return -1;
+    case ENFILE: *__error_nid_postfix() = 23; return -1;
+    default: throw std::runtime_error(std::string("getifaddrs: ") + operation + " failed: " + std::strerror(hostError));
+    }
+}
+
 std::uint32_t InterfaceFlags(unsigned int host) {
     constexpr std::pair<unsigned int, std::uint32_t> flags[] = {
         {IFF_UP, guestUp}, {IFF_BROADCAST, guestBroadcast}, {IFF_LOOPBACK, guestLoopback},
@@ -243,16 +263,7 @@ Entry& FindOrAdd(std::vector<Entry>& entries, const char* name, std::uint32_t fl
 
 int HostEntries(std::vector<Entry>& entries) {
     ifaddrs* host = nullptr;
-    if (::getifaddrs(&host) != 0) {
-        const int hostError = errno;
-        switch (hostError) {
-        case ENOMEM: *__error_nid_postfix() = 12; return -1;
-        case ENOBUFS: *__error_nid_postfix() = 55; return -1;
-        case EMFILE: *__error_nid_postfix() = 24; return -1;
-        case ENFILE: *__error_nid_postfix() = 23; return -1;
-        default: throw std::runtime_error(std::string("getifaddrs: host enumeration failed: ") + std::strerror(hostError));
-        }
-    }
+    if (::getifaddrs(&host) != 0) return GuestHostError(errno, "host enumeration");
     try {
         for (auto* item = host; item; item = item->ifa_next) {
             if (!item->ifa_name || !item->ifa_addr) continue;
@@ -274,27 +285,15 @@ int HostEntries(std::vector<Entry>& entries) {
             if (family != AF_INET && family != AF_INET6) continue;
             if (!item->ifa_netmask) throw std::runtime_error(std::string("getifaddrs: host address without a netmask on ") + item->ifa_name);
             Entry& entry = FindOrAdd(entries, item->ifa_name, flags);
-            Address addr;
-            if (family == AF_INET) {
-                addr.family = guestAfInet;
-                addr.address = GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(item->ifa_addr)->sin_addr));
-                addr.netmask = GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(item->ifa_netmask)->sin_addr));
-                if (item->ifa_flags & IFF_POINTOPOINT) {
-                    if (item->ifa_dstaddr && item->ifa_dstaddr->sa_family == AF_INET)
-                        addr.destination = GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(item->ifa_dstaddr)->sin_addr));
-                    else entry.flags &= ~guestPointToPoint;
-                } else if (item->ifa_flags & IFF_BROADCAST) {
-                    addr.destination = item->ifa_broadaddr && item->ifa_broadaddr->sa_family == AF_INET
-                        ? GuestIpv4(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in*>(item->ifa_broadaddr)->sin_addr))
-                        : BroadcastAddress(addr.address, addr.netmask);
-                }
-                entry.v4.push_back(std::move(addr));
-            } else {
-                addr.family = guestAfInet6;
-                addr.address = GuestIpv6(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in6*>(item->ifa_addr)->sin6_addr), reinterpret_cast<const sockaddr_in6*>(item->ifa_addr)->sin6_scope_id);
-                addr.netmask = GuestIpv6(reinterpret_cast<const std::uint8_t*>(&reinterpret_cast<const sockaddr_in6*>(item->ifa_netmask)->sin6_addr), 0);
-                entry.v6.push_back(std::move(addr));
+            Address addr{family == AF_INET ? guestAfInet : guestAfInet6, flags, GuestAddress(item->ifa_addr), GuestAddress(item->ifa_netmask), {}};
+            if (item->ifa_flags & IFF_POINTOPOINT) {
+                if (item->ifa_dstaddr && item->ifa_dstaddr->sa_family == family) addr.destination = GuestAddress(item->ifa_dstaddr);
+                else addr.flags &= ~guestPointToPoint;
+            } else if (family == AF_INET && (item->ifa_flags & IFF_BROADCAST)) {
+                addr.destination = item->ifa_broadaddr && item->ifa_broadaddr->sa_family == AF_INET
+                    ? GuestAddress(item->ifa_broadaddr) : BroadcastAddress(addr.address, addr.netmask);
             }
+            (family == AF_INET ? entry.v4 : entry.v6).push_back(std::move(addr));
         }
     } catch (...) {
         ::freeifaddrs(host);
@@ -302,15 +301,20 @@ int HostEntries(std::vector<Entry>& entries) {
     }
     ::freeifaddrs(host);
 #ifdef __linux__
-    const int descriptor = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (descriptor >= 0) {
-        for (auto& entry : entries) {
-            ifreq info{};
-            std::strncpy(info.ifr_name, entry.name.c_str(), IFNAMSIZ - 1);
-            if (::ioctl(descriptor, SIOCGIFMTU, &info) == 0) entry.mtu = static_cast<std::uint32_t>(info.ifr_mtu);
+    const int descriptor = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) return GuestHostError(errno, "MTU socket");
+    for (auto& entry : entries) {
+        if (!entry.hasLink) continue;
+        ifreq info{};
+        std::strncpy(info.ifr_name, entry.name.c_str(), IFNAMSIZ - 1);
+        if (::ioctl(descriptor, SIOCGIFMTU, &info) != 0) {
+            const int hostError = errno;
+            ::close(descriptor);
+            throw std::runtime_error("getifaddrs: SIOCGIFMTU failed on " + entry.name + ": " + std::strerror(hostError));
         }
-        ::close(descriptor);
+        entry.mtu = static_cast<std::uint32_t>(info.ifr_mtu);
     }
+    ::close(descriptor);
 #endif
     for (auto& entry : entries)
         SetType(entry);
@@ -362,12 +366,10 @@ int APS5_VABI getifaddrs_nid_postfix(GuestInterfaceAddress** list) {
             return target;
         };
         std::size_t index = 0;
-        const auto emit = [&](const Entry& entry, const std::vector<std::uint8_t>& address, const std::vector<std::uint8_t>& netmask, const std::vector<std::uint8_t>& destination, const std::vector<std::uint8_t>& data) {
+        const auto emit = [&](const Entry& entry, std::uint32_t flags, const std::vector<std::uint8_t>& address, const std::vector<std::uint8_t>& netmask, const std::vector<std::uint8_t>& destination, const std::vector<std::uint8_t>& data) {
             GuestInterfaceAddress& item = items[index];
             item.next = index + 1 < itemCount ? &items[index + 1] : nullptr;
             item.name = static_cast<char*>(place(entry.name.c_str(), entry.name.size() + 1));
-            std::uint32_t flags = entry.flags;
-            if (data.empty() && destination.empty()) flags &= ~guestPointToPoint;
             item.flags = flags;
             item.address = place(address.data(), address.size());
             item.netmask = netmask.empty() ? nullptr : place(netmask.data(), netmask.size());
@@ -376,9 +378,9 @@ int APS5_VABI getifaddrs_nid_postfix(GuestInterfaceAddress** list) {
             ++index;
         };
         for (const auto& entry : entries) {
-            if (entry.hasLink) emit(entry, GuestSockaddrDl(entry), {}, {}, GuestIfData(entry));
-            for (const auto& address : entry.v4) emit(entry, address.address, address.netmask, address.destination, {});
-            for (const auto& address : entry.v6) emit(entry, address.address, address.netmask, address.destination, {});
+            if (entry.hasLink) emit(entry, entry.flags, GuestSockaddrDl(entry), {}, {}, GuestIfData(entry));
+            for (const auto& address : entry.v4) emit(entry, address.flags, address.address, address.netmask, address.destination, {});
+            for (const auto& address : entry.v6) emit(entry, address.flags, address.address, address.netmask, address.destination, {});
         }
         *list = items;
         return 0;
